@@ -17,6 +17,9 @@ const (
 	ErrCodeTokenMissingClaim     ErrorCode = "TOKEN_MISSING_CLAIM"
 	ErrCodeCrossTenant           ErrorCode = "CROSS_TENANT_ACCESS"
 	ErrCodeQuotaExceeded         ErrorCode = "QUOTA_EXCEEDED"
+	ErrCodeDeadlineExceeded      ErrorCode = "DEADLINE_EXCEEDED"
+	ErrCodeUpstreamFailure       ErrorCode = "UPSTREAM_FAILURE"
+	ErrCodeRequestCancelled      ErrorCode = "REQUEST_CANCELLED"
 	ErrCodeInternal              ErrorCode = "INTERNAL"
 )
 
@@ -25,6 +28,7 @@ type Error struct {
 	Code       ErrorCode
 	Message    string
 	RetryAfter time.Duration // 限流时可重试的元信息
+	Retryable  bool          // 为 true 时调用方可稍后重试（限流、超时）
 	cause      error
 }
 

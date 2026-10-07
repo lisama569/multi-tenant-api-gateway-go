@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 )
@@ -11,6 +12,11 @@ type Request struct {
 	Token    string
 	TenantID string // 目标资源所属租户
 	Path     string
+	// MaxDuration 是单个请求的最长处理时间；<=0 表示不限制。
+	// 超时后网关返回 DEADLINE_EXCEEDED（可重试），并立即归还并发额度。
+	MaxDuration time.Duration
+	// MaxQueueWait 是配额满时允许排队等待的最长时间；<=0 表示立即拒绝。
+	MaxQueueWait time.Duration
 }
 
 // Response 是网关成功时的响应。
@@ -39,8 +45,11 @@ func NewGateway(v *TokenValidator, q *QuotaManager, a AuditSink, h Handler, logg
 	return &Gateway{validator: v, quota: q, audit: a, handler: h, logger: logger, now: time.Now}
 }
 
-// writeAudit 写入审计记录；写入失败只记录日志，不改变主流程结论。
+// writeAudit 写入审计记录并输出判定日志；写入失败只记录日志，不改变主流程结论。
 func (g *Gateway) writeAudit(rec AuditRecord) {
+	g.logger.Printf("DECISION tenant=%s subject=%s path=%s decision=%s reason=%s quota=%d/%d",
+		rec.TenantID, rec.Subject, rec.Path, rec.Decision, rec.Reason,
+		rec.Quota.InFlight, rec.Quota.MaxConcurrent)
 	if g.audit == nil {
 		return
 	}
@@ -48,6 +57,49 @@ func (g *Gateway) writeAudit(rec AuditRecord) {
 	if err := g.audit.Write(rec); err != nil {
 		g.logger.Printf("AUDIT_WRITE_FAILED tenant=%s path=%s decision=%s err=%v",
 			rec.TenantID, rec.Path, rec.Decision, Normalize(err))
+	}
+}
+
+// safeCall 调用下游处理器并隔离 panic：下游不可恢复的异常被转换为
+// 稳定的 UPSTREAM_FAILURE 结论，不会拖垮进程或其它租户。
+func (g *Gateway) safeCall(ctx context.Context, req Request) (body string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			g.logger.Printf("UPSTREAM_PANIC tenant=%s path=%s panic=%v", req.TenantID, req.Path, r)
+			body = ""
+			err = newError(ErrCodeUpstreamFailure, "upstream handler failed",
+				fmt.Errorf("panic: %v", r))
+		}
+	}()
+	return g.handler(ctx, req)
+}
+
+// invoke 在 MaxDuration 约束下调用下游。超时返回可重试的 DEADLINE_EXCEEDED；
+// 超时后下游 goroutine 可能仍在运行，但其结果会被丢弃，调用方拿到的是稳定结论。
+func (g *Gateway) invoke(ctx context.Context, req Request) (string, error) {
+	if req.MaxDuration <= 0 {
+		return g.safeCall(ctx, req)
+	}
+	type result struct {
+		body string
+		err  error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		body, err := g.safeCall(ctx, req)
+		resCh <- result{body, err}
+	}()
+	timer := time.NewTimer(req.MaxDuration)
+	defer timer.Stop()
+	select {
+	case r := <-resCh:
+		return r.body, r.err
+	case <-timer.C:
+		err := newError(ErrCodeDeadlineExceeded, "request exceeded max processing time", nil)
+		err.Retryable = true
+		return "", err
+	case <-ctx.Done():
+		return "", newError(ErrCodeRequestCancelled, "request cancelled while processing", ctx.Err())
 	}
 }
 
@@ -74,7 +126,7 @@ func (g *Gateway) Handle(ctx context.Context, req Request) (Response, error) {
 		return Response{}, ge
 	}
 
-	release, snap, err := g.quota.Acquire(req.TenantID)
+	release, snap, err := g.quota.AcquireWait(ctx, req.TenantID, req.MaxQueueWait)
 	if err != nil {
 		ge := Normalize(err)
 		rec := AuditRecord{
@@ -90,7 +142,7 @@ func (g *Gateway) Handle(ctx context.Context, req Request) (Response, error) {
 	}
 	defer release()
 
-	body, herr := g.handler(ctx, req)
+	body, herr := g.invoke(ctx, req)
 	if herr != nil {
 		ge := Normalize(herr)
 		g.writeAudit(AuditRecord{
